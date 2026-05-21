@@ -81,8 +81,11 @@ func printReport(a Assessment) {
 		for _, s := range a.PacerTrace {
 			switch s.Action {
 			case actBackoff, actBlock:
-				fmt.Printf("    #%-2d :%-6d  lost              -> %-9s interval %.0fs\n",
+				fmt.Printf("    #%-2d :%-6d  silent            -> %-9s interval %.0fs\n",
 					s.Probe, s.Port, s.Action, s.IntervalS)
+			case actRefused:
+				fmt.Printf("    #%-2d :%-6d  RST (port closed) -> %-9s\n",
+					s.Probe, s.Port, s.Action)
 			case actBaseline:
 				fmt.Printf("    #%-2d :%-6d  %.0fms              -> baseline (detector learning)\n",
 					s.Probe, s.Port, s.RTTms)

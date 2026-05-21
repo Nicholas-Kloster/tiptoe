@@ -46,13 +46,13 @@ type Pacer struct {
 	blockAfter   int           // consecutive losses that mean "blocked", not "slow"
 
 	// live state
-	susp       *suspicion // phi-accrual detector over the host's RTTs
-	interval   time.Duration
-	consecLoss int
-	probes     int
-	blocked    bool
-	blockMsg   string
-	trace      []PacerSnap
+	susp         *suspicion // phi-accrual detector over the host's RTTs
+	interval     time.Duration
+	consecSilent int // consecutive silent drops — the block-detection counter
+	probes       int
+	blocked      bool
+	blockMsg     string
+	trace        []PacerSnap
 }
 
 // PacerSnap is one entry in the control trace — what the pacer saw and decided
@@ -72,9 +72,10 @@ const (
 	actSpeedUp  = "speed-up"  // suspicion low — additive decrease of the interval
 	actSlowDown = "slow-down" // suspicion high — proactive additive increase
 	actHold     = "hold"      // suspicion in the neutral band
-	actBackoff  = "backoff"   // a probe was lost — multiplicative increase
-	actBlock    = "block"     // losses persisted through backoff — host filtered us
+	actBackoff  = "backoff"   // a probe was dropped — multiplicative increase
+	actBlock    = "block"     // silence persisted through backoff — host filtered us
 	actBaseline = "baseline"  // detector still learning the host's normal RTT
+	actRefused  = "refused"   // a TCP RST — port closed, host still reachable
 )
 
 // NewPacer returns a Pacer tuned for stealth: cautious start, slow floor,
@@ -95,34 +96,49 @@ func NewPacer() *Pacer {
 	}
 }
 
-// Wait sleeps for the current interval, randomized by ±jitter. A perfectly
-// periodic probe train is itself a signature; the jitter breaks the cadence.
-func (p *Pacer) Wait() {
+// NextDelay returns how long to wait before the next probe: the current
+// control interval, randomized by ±jitter. A perfectly periodic probe train is
+// itself a signature, so the jitter breaks the cadence. The caller performs
+// the wait, so it can animate a live countdown over it.
+func (p *Pacer) NextDelay() time.Duration {
 	d := float64(p.interval) * (1 + (rand.Float64()*2-1)*p.jitter)
-	time.Sleep(time.Duration(d))
+	return time.Duration(d)
 }
 
 // Observe feeds the pacer one probe outcome and updates the control state.
-// lost is true when the probe got no answer (a silent drop); reset is true
-// when the host sent a TCP RST. Both count as a lost segment; a RST, the
-// louder signal, is backed off harder.
+// lost is true when the probe got no answer; reset is true when the host sent
+// a TCP RST. The two are not the same signal: a RST is a definitive answer (a
+// closed port on a reachable host), while a silent drop is the fingerprint of
+// a filter. Only silence drives block detection — a host that filters you
+// drops your packets, it does not refuse them.
 func (p *Pacer) Observe(port int, rtt time.Duration, lost, reset bool) {
 	p.probes++
 	snap := PacerSnap{Probe: p.probes, Port: port}
 
+	if reset {
+		// A TCP RST means the port is closed but the host is reachable and
+		// still talking to us. That is not a block. It clears the silence
+		// streak and leaves the probe rate alone — a refusal is instant and
+		// carries no congestion signal.
+		p.consecSilent = 0
+		snap.Action = actRefused
+		snap.IntervalS = p.interval.Seconds()
+		p.trace = append(p.trace, snap)
+		return
+	}
+
 	if lost {
-		p.consecLoss++
-		factor := p.backoff
-		if reset {
-			factor *= 1.5 // an active refusal is a stronger "you are noticed"
-		}
-		p.interval = clampDur(time.Duration(float64(p.interval)*factor),
+		// A silent drop is the filter signal. Back off multiplicatively; if
+		// the host stays silent through the backoff, conclude it has filtered
+		// us rather than merely slowed.
+		p.consecSilent++
+		p.interval = clampDur(time.Duration(float64(p.interval)*p.backoff),
 			p.minInterval, p.maxInterval)
 		snap.Action = actBackoff
-		if p.consecLoss >= p.blockAfter {
+		if p.consecSilent >= p.blockAfter {
 			p.blocked = true
 			snap.Action = actBlock
-			p.blockMsg = "host stopped answering and stayed silent through the " +
+			p.blockMsg = "host went silent and stayed silent through the " +
 				"pacer's full backoff — it has filtered us, not merely slowed"
 		}
 		snap.IntervalS = p.interval.Seconds()
@@ -130,8 +146,8 @@ func (p *Pacer) Observe(port int, rtt time.Duration, lost, reset bool) {
 		return
 	}
 
-	// a good probe — clear the loss streak and feed the suspicion detector
-	p.consecLoss = 0
+	// a good probe — clear the silence streak and feed the suspicion detector
+	p.consecSilent = 0
 	rttMs := rtt.Seconds() * 1000
 	p.susp.observe(rttMs)
 	mean, _ := p.susp.stats()

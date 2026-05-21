@@ -23,28 +23,62 @@ import (
 
 const version = "0.1.0"
 
-const banner = `
-  _   _       _
- | |_(_)_ __ | |_ ___   ___
- | __| | '_ \| __/ _ \ / _ \
- | |_| | |_) | || (_) |  __/
-  \__|_| .__/ \__\___/ \___|   quiet, block-aware AI-infra assessment
-       |_|                     v%s · NuClide Research
-`
+// ANSI styling. Emitted only when stderr is a real terminal, so a piped or
+// redirected run stays clean.
+const (
+	ansiReset = "\x1b[0m"
+	ansiCyan  = "\x1b[36m"
+	ansiBold  = "\x1b[1m"
+	ansiDim   = "\x1b[2m"
+)
+
+var stderrTTY = func() bool {
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}()
+
+func sgr(code string) string {
+	if stderrTTY {
+		return code
+	}
+	return ""
+}
+
+// printBanner writes the tiptoe banner to stderr — stdout is left clean so
+// `--json` output is never polluted.
+func printBanner() {
+	fmt.Fprint(os.Stderr, sgr(ansiCyan)+`
+   _   _      _
+  | |_(_)_ __| |_ ___  ___
+  | __| | '_ \ __/ _ \/ -_)
+   \__|_| .__/\__\___/\___|
+        |_|`+sgr(ansiReset)+sgr(ansiDim)+`   v`+version+`  ·  NuClide Research`+
+		sgr(ansiReset)+`
+
+`+sgr(ansiBold)+`   quiet, block-aware assessment for AI/LLM infrastructure`+
+		sgr(ansiReset)+`
+`+sgr(ansiDim)+`   the arsenal goes loud across thousands of hosts;
+   tiptoe assesses the one host that watches back.`+sgr(ansiReset)+"\n")
+}
 
 func usage() {
-	fmt.Fprintf(os.Stderr, banner, version)
+	printBanner()
 	fmt.Fprint(os.Stderr, `
 usage:
   tiptoe assess  <host>   passive intel, then congestion-controlled active probing
-  tiptoe passive <host>   passive intel only — zero packets to the target
-  tiptoe version
+  tiptoe passive <host>   passive intel only, zero packets to the target
+  tiptoe version          print the version and exit
 
 assess flags:
   --ports <csv>     ports to probe (default: ports from passive intel)
   --timeout <dur>   per-probe timeout (default 10s)
   --json            emit JSON instead of the human report
   --passive-only    skip the active phase
+
+examples:
+  tiptoe assess  manglillo.example.edu
+  tiptoe assess  10.0.0.1 --ports 8000,8888 --json
+  tiptoe passive lab.example.edu
 
 `)
 }
@@ -80,19 +114,25 @@ func runCmd(args []string, passiveOnly bool) {
 	portsCSV := fs.String("ports", "", "comma-separated ports to probe")
 	timeout := fs.Duration("timeout", 10*time.Second, "per-probe timeout")
 	forcePassive := fs.Bool("passive-only", false, "skip the active phase")
+	// The stdlib flag package stops parsing at the first non-flag argument,
+	// so `tiptoe assess host --json` would silently leave --json unparsed.
+	// Parse once, lift out the host, then parse whatever flags followed it.
 	_ = fs.Parse(args)
-
-	if fs.NArg() < 1 {
+	rest := fs.Args()
+	if len(rest) == 0 {
 		fmt.Fprintf(os.Stderr, "tiptoe %s: need a host\n", name)
 		os.Exit(2)
 	}
-	host := fs.Arg(0)
+	host := rest[0]
+	if len(rest) > 1 {
+		_ = fs.Parse(rest[1:])
+	}
 	if passiveOnly {
 		*forcePassive = true
 	}
 
 	if !*jsonOut {
-		fmt.Fprintf(os.Stderr, banner, version)
+		printBanner()
 	}
 	fmt.Fprintf(os.Stderr, "[*] passive intel — %s\n", host)
 
@@ -123,8 +163,8 @@ func runCmd(args []string, passiveOnly bool) {
 				"or the host has no passive footprint")
 		} else {
 			fmt.Fprintf(os.Stderr, "[*] active phase — %d port(s), serialized, "+
-				"congestion-controlled pacing\n", len(ports))
-			a = runAssessment(intel, ports, *timeout, NewPacer())
+				"congestion-controlled pacing\n\n", len(ports))
+			a = runAssessment(intel, ports, *timeout, NewPacer(), !*jsonOut)
 		}
 	}
 
