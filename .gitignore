@@ -1,0 +1,14 @@
+# build output
+/tiptoe
+tiptoe.exe
+
+# go
+*.test
+*.out
+*.prof
+
+# os
+.DS_Store
+
+# local scratch
+*.local.json
