@@ -38,6 +38,8 @@ type Intel struct {
 type Probe struct {
 	Port       int           `json:"port"`
 	Service    string        `json:"service,omitempty"`
+	Family     string        `json:"family,omitempty"`
+	Match      string        `json:"match,omitempty"`
 	TCPOpen    bool          `json:"tcp_open"`
 	RTT        time.Duration `json:"-"`
 	RTTms      float64       `json:"rtt_ms"`
@@ -46,6 +48,16 @@ type Probe struct {
 	Evidence   string        `json:"evidence,omitempty"`
 	Provenance Provenance    `json:"provenance"`
 }
+
+// Match confidence — borrowed from nmap's service-detection engine. A
+// confirmed match means the platform's own API contract was spoken and
+// answered; a tentative match is a soft signal only (nmap's "softmatch") —
+// the family is likely but unproven. tiptoe never reports a finding off a
+// tentative match: claim only what the response proves (Insight #51).
+const (
+	MatchConfirmed = "confirmed"
+	MatchTentative = "tentative"
+)
 
 // Probe states.
 const (

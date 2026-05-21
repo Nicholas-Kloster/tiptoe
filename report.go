@@ -65,13 +65,17 @@ func printReport(a Assessment) {
 				if svc == "" {
 					svc = "unidentified"
 				}
-				fmt.Printf("    :%-6d %-22s [%s]  %.0fms\n",
-					p.Port, svc, p.State, p.RTTms)
+				tag := ""
+				if p.Match == MatchTentative {
+					tag = "  (tentative — family-level match only)"
+				}
+				fmt.Printf("    :%-6d %-26s [%s]  %.0fms%s\n",
+					p.Port, svc, p.State, p.RTTms, tag)
 				if p.Evidence != "" {
 					fmt.Printf("             %s\n", p.Evidence)
 				}
 			} else {
-				fmt.Printf("    :%-6d %-22s [%s]\n", p.Port, "—", p.State)
+				fmt.Printf("    :%-6d %-26s [%s]\n", p.Port, "—", p.State)
 			}
 		}
 	}

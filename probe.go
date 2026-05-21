@@ -60,103 +60,160 @@ func dialRTT(ip string, port int, timeout time.Duration) (time.Duration, bool, b
 	return rtt, true, false
 }
 
-// identify runs the AI/LLM-focused fingerprint ladder against an open port and
-// fills in the Probe's service, state, severity and evidence. It makes at most
-// a handful of requests, all to one port, all read-only.
+// llmSignature describes how to identify one AI/LLM platform. The probe layer
+// is a declarative table of these rather than a hardcoded chain, which makes
+// the false-positive resistance an engineered property — a match is claimed
+// only when the platform's own API answers — and makes adding the rest of the
+// LLM-infra stack a one-row change.
+type llmSignature struct {
+	platform    string // display name
+	family      string // model-runtime / notebook / ui
+	rootHint    string // lowercase substring in GET / body or headers (a soft signal)
+	confirmPath string // an API path that proves identity
+	confirmHint string // a substring a 200 confirm response must contain
+	versionKey  string // JSON key holding the version, when the confirm response has one
+	authPath    string // path whose HTTP status reveals the auth state (optional)
+	noAuth      bool   // platform ships no auth, so a confirmed match is itself an exposure
+}
+
+// signatures is tiptoe's LLM-infrastructure knowledge, kept as data. Every row
+// was checked against how the platform actually answers; an unverified
+// platform is left out rather than guessed. Table order is match priority:
+// specific platforms before the generic OpenAI-compatible catch-all.
+var signatures = []llmSignature{
+	{platform: "Ollama", family: "model-runtime", rootHint: "ollama is running",
+		confirmPath: "/api/tags", confirmHint: `"models"`, noAuth: true},
+	{platform: "JupyterHub", family: "notebook", rootHint: "/hub/",
+		confirmPath: "/hub/api", confirmHint: `"version"`, versionKey: "version",
+		authPath: "/hub/api/users"},
+	{platform: "Open WebUI", family: "ui", rootHint: "open webui",
+		confirmPath: "/api/config", confirmHint: `"name"`, versionKey: "version"},
+	{platform: "Gradio", family: "ui", rootHint: "gradio",
+		confirmPath: "/config", confirmHint: `"version"`, versionKey: "version"},
+	{platform: "Jupyter Server", family: "notebook",
+		confirmPath: "/api", confirmHint: `"version"`, versionKey: "version",
+		authPath: "/api/contents"},
+	{platform: "Text Generation Inference", family: "model-runtime",
+		confirmPath: "/info", confirmHint: `"model_id"`, versionKey: "version",
+		noAuth: true},
+	{platform: "OpenAI-compatible model server", family: "model-runtime",
+		confirmPath: "/v1/models", confirmHint: `"data"`, noAuth: true},
+}
+
+// identify walks the signature table against an open port and fills in the
+// Probe's service, family, match confidence, state and evidence. GET / is the
+// one universal probe; a platform's own API is the proof. At most a handful of
+// requests, all read-only, all to the one port.
 func identify(p *Probe, ip, hostname string, port int, timeout time.Duration) {
 	client := newHTTPClient(timeout)
 	host := ip
 	if hostname != "" && net.ParseIP(hostname) == nil {
-		host = hostname // prefer the name — virtual-hosted services need it
+		host = hostname // a virtual-hosted service needs its name
 	}
 
 	for _, scheme := range []string{"http", "https"} {
 		base := fmt.Sprintf("%s://%s:%d", scheme, host, port)
-		st, hdr, body, ok := httpGet(client, base+"/")
+		rootStatus, rootHdr, rootBody, ok := httpGet(client, base+"/")
 		if !ok {
 			continue
 		}
+		rootText := strings.ToLower(rootHdr + "\n" + rootBody)
 
-		// Ollama — answers "/" with a plain-text liveness string, no auth.
-		if strings.Contains(body, "Ollama is running") {
-			_, _, tags, _ := httpGet(client, base+"/api/tags")
-			n := strings.Count(tags, `"name"`)
-			p.Service, p.State, p.Severity = "Ollama", StateUnauth, "HIGH"
-			p.Evidence = fmt.Sprintf("Ollama answered /api/tags unauthenticated "+
-				"(%d model entries; no auth — Ollama ships none)", n)
-			return
-		}
-
-		// JupyterHub — multi-user. /hub/api carries the version; /hub/api/users
-		// is admin-scoped and is the auth-state marker.
-		if strings.Contains(body, "JupyterHub") || strings.Contains(hdr, "/hub/") ||
-			strings.Contains(body, "/hub/login") {
-			_, _, hubAPI, _ := httpGet(client, base+"/hub/api")
-			ver := jsonField(hubAPI, "version")
-			us, _, _, _ := httpGet(client, base+"/hub/api/users")
-			if us == 200 {
-				p.Service, p.State, p.Severity = "JupyterHub", StateUnauth, "HIGH"
-				p.Evidence = fmt.Sprintf("JupyterHub %s — /hub/api/users answered "+
-					"200 with no token (admin API readable)", ver)
-			} else {
-				p.Service, p.State, p.Severity = "JupyterHub", StateAuth, "LOW"
-				p.Evidence = fmt.Sprintf("JupyterHub %s confirmed; /hub/api/users "+
-					"-> %d (authentication enforced)", ver, us)
+		// strong candidates — those GET / hinted at — go first, then the rest
+		hinted := map[string]bool{}
+		var ordered []llmSignature
+		for _, sig := range signatures {
+			if sig.rootHint != "" && strings.Contains(rootText, sig.rootHint) {
+				ordered = append(ordered, sig)
+				hinted[sig.platform] = true
 			}
-			return
 		}
-
-		// Jupyter Server / Notebook — single-user. /api carries the version.
-		if apiSt, _, apiBody, _ := httpGet(client, base+"/api"); apiSt == 200 &&
-			strings.Contains(apiBody, `"version"`) {
-			ver := jsonField(apiBody, "version")
-			cs, _, _, _ := httpGet(client, base+"/api/contents")
-			if cs == 200 {
-				p.Service, p.State, p.Severity = "Jupyter Server", StateUnauth, "HIGH"
-				p.Evidence = fmt.Sprintf("Jupyter Server %s — /api/contents "+
-					"answered 200 with no token (notebook tree readable)", ver)
-			} else {
-				p.Service, p.State, p.Severity = "Jupyter Server", StateAuth, "LOW"
-				p.Evidence = fmt.Sprintf("Jupyter Server %s confirmed; "+
-					"/api/contents -> %d (token required)", ver, cs)
+		for _, sig := range signatures {
+			if !hinted[sig.platform] {
+				ordered = append(ordered, sig)
 			}
+		}
+
+		const maxConfirm = 6 // intensity cap: one conversation, not a scan
+		var soft *llmSignature
+		for i := 0; i < len(ordered) && i < maxConfirm; i++ {
+			sig := ordered[i]
+			cs, _, cbody, cok := httpGet(client, base+sig.confirmPath)
+			if cok && cs == 200 && strings.Contains(cbody, sig.confirmHint) {
+				fillConfirmed(p, client, base, sig, cbody)
+				return
+			}
+			if hinted[sig.platform] && soft == nil {
+				s := sig
+				soft = &s
+			}
+		}
+
+		if soft != nil {
+			// the root page resembled this platform but its API never
+			// confirmed: a softmatch. Name the family, claim no finding.
+			p.Service, p.Family, p.Match = soft.platform, soft.family, MatchTentative
+			p.State, p.Severity = StateOther, "INFO"
+			p.Evidence = fmt.Sprintf("root page resembles %s; its API (%s) did "+
+				"not confirm. Family-level match only.", soft.platform, soft.confirmPath)
 			return
 		}
 
-		// vLLM / any OpenAI-compatible model server — /v1/models lists models.
-		if mSt, _, mBody, _ := httpGet(client, base+"/v1/models"); mSt == 200 &&
-			strings.Contains(mBody, `"data"`) {
-			n := strings.Count(mBody, `"id"`)
-			p.Service, p.State, p.Severity = "OpenAI-compatible model server",
-				StateUnauth, "HIGH"
-			p.Evidence = fmt.Sprintf("/v1/models answered 200 unauthenticated "+
-				"(%d model(s) listed)", n)
-			return
-		}
-
-		// generic HTTP — name it from the Server header or the page title.
-		server := headerValue(hdr, "Server")
-		title := pageTitle(body)
+		server := headerValue(rootHdr, "Server")
 		desc := server
 		if desc == "" {
-			desc = title
+			desc = pageTitle(rootBody)
 		}
 		if desc == "" {
-			desc = fmt.Sprintf("HTTP %d", st)
+			desc = fmt.Sprintf("HTTP %d", rootStatus)
 		}
-		p.Service, p.State, p.Severity = "web service", StateOther, "INFO"
-		p.Evidence = fmt.Sprintf("HTTP %d, %s — not a recognized AI/LLM service", st, desc)
+		p.Service, p.Family = "web service", "web"
+		p.State, p.Severity = StateOther, "INFO"
+		p.Evidence = fmt.Sprintf("HTTP %d, %s. Not a recognized AI/LLM platform.",
+			rootStatus, desc)
 		return
 	}
 
-	// not HTTP — try a plain banner read
 	if b := bannerGrab(ip, port, timeout); b != "" {
 		p.Service, p.State, p.Severity = "unidentified", StateOpen, "INFO"
 		p.Evidence = "banner: " + b
 		return
 	}
 	p.Service, p.State, p.Severity = "unidentified", StateOpen, "INFO"
-	p.Evidence = "TCP open; no HTTP response and no banner — service not identified"
+	p.Evidence = "TCP open; no HTTP response and no banner. Service not identified."
+}
+
+// fillConfirmed records a confirmed platform match and resolves its auth state.
+func fillConfirmed(p *Probe, client *http.Client, base string, sig llmSignature, confirmBody string) {
+	name := sig.platform
+	if sig.versionKey != "" {
+		if v := jsonField(confirmBody, sig.versionKey); v != "" && v != "?" {
+			name += " " + v
+		}
+	}
+	p.Service, p.Family, p.Match = name, sig.family, MatchConfirmed
+
+	switch {
+	case sig.noAuth:
+		p.State, p.Severity = StateUnauth, "HIGH"
+		p.Evidence = fmt.Sprintf("%s confirmed via %s; the platform ships no "+
+			"authentication, so this is unauthenticated access.", name, sig.confirmPath)
+	case sig.authPath != "":
+		st, _, _, ok := httpGet(client, base+sig.authPath)
+		if ok && st == 200 {
+			p.State, p.Severity = StateUnauth, "HIGH"
+			p.Evidence = fmt.Sprintf("%s confirmed; %s answered 200 with no "+
+				"credentials. Unauthenticated access.", name, sig.authPath)
+		} else {
+			p.State, p.Severity = StateAuth, "LOW"
+			p.Evidence = fmt.Sprintf("%s confirmed; %s returned %d. "+
+				"Authentication enforced.", name, sig.authPath, st)
+		}
+	default:
+		p.State, p.Severity = StateOther, "INFO"
+		p.Evidence = fmt.Sprintf("%s confirmed via %s; auth state not probed.",
+			name, sig.confirmPath)
+	}
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {
