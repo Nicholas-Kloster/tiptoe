@@ -81,8 +81,31 @@ tiptoe assess  10.0.0.1 --ports 8000,8888 # probe a specific port set
 tiptoe assess  host --json                # machine-readable output for the chain
 ```
 
-By default the active phase probes the ports passive intel turned up. Pass
-`--ports` to override.
+An IP address is the only required argument. By default the active phase
+probes the ports passive intel turned up, so for an IP that Shodan has
+indexed, `tiptoe assess <ip>` is fully automatic. For an IP with no Shodan
+record, pass `--ports`.
+
+`--timeout` takes a duration with a unit (`8s`, `1m`), not a bare number.
+
+## What it needs, and what to expect
+
+- **Shodan API key** at `~/.shodan/api_key` — the passive phase reads
+  Shodan's cached host record, which is also where the default port list
+  comes from. Without it, pass `--ports` explicitly.
+- **It is slow on purpose.** The congestion-control pacer waits 8–120
+  seconds between probes, so a host with several ports can take minutes.
+  The live status line shows a countdown so the wait reads as progress.
+  For a quick first run, name two or three ports with `--ports`.
+
+## Where it fits a recon toolchain
+
+Population scanners (aimap, menlohunt, JAXEN-class tools) are loud and fast
+across thousands of hosts. tiptoe is the opposite end of that spectrum: the
+single monitored host you do not want to spook, or re-probing a host an
+aggressive scan already got the source filtered from. Its `--json` output
+is shaped for ledger ingest, so it slots in after discovery as a quiet
+verification stage.
 
 ## Output
 
